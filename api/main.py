@@ -14,10 +14,15 @@ import hashlib
 import gc
 import psutil
 
-# Configurar TensorFlow antes de importar
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduzir logs do TensorFlow
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # Crescimento gradual da GPU
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Desabilitar otimizações que podem causar problemas
+# Configurar TensorFlow antes de importar - FORÇAR CPU APENAS
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suprimir todos os logs do TensorFlow
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Desabilitar completamente CUDA/GPU
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'false'  # Desabilitar GPU
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Desabilitar otimizações OneDNN
+os.environ['TF_DISABLE_MKL'] = '1'  # Desabilitar MKL que pode causar problemas
+os.environ['TF_NUM_INTEROP_THREADS'] = '1'  # Limitar threads
+os.environ['TF_NUM_INTRAOP_THREADS'] = '1'  # Limitar threads
+os.environ['OMP_NUM_THREADS'] = '1'  # Limitar OpenMP threads
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -137,25 +142,28 @@ def download_model_with_retry(max_retries=3):
     return False
 
 def configure_tensorflow():
-    """Configura TensorFlow para uso otimizado de memória"""
+    """Configura TensorFlow para uso APENAS de CPU (sem GPU)"""
     try:
         import tensorflow as tf
 
-        # Configurar crescimento de memória da GPU
-        gpus = tf.config.experimental.list_physical_devices('GPU')
-        if gpus:
-            try:
-                for gpu in gpus:
-                    tf.config.experimental.set_memory_growth(gpu, True)
-                logger.info(f"✅ Configurado crescimento de memória para {len(gpus)} GPU(s)")
-            except RuntimeError as e:
-                logger.warning(f"Erro ao configurar GPU: {e}")
+        # FORÇAR USO APENAS DE CPU
+        tf.config.set_visible_devices([], 'GPU')
 
-        # Configurar threads para CPU
-        tf.config.threading.set_intra_op_parallelism_threads(2)
-        tf.config.threading.set_inter_op_parallelism_threads(2)
+        # Configurar threads de forma muito conservadora
+        tf.config.threading.set_intra_op_parallelism_threads(1)
+        tf.config.threading.set_inter_op_parallelism_threads(1)
 
-        logger.info("✅ TensorFlow configurado para uso otimizado de memória")
+        # Configurar uso de memória de forma conservadora
+        tf.config.experimental.enable_memory_growth = False
+
+        # Verificar se GPU foi realmente desabilitada
+        gpus = tf.config.list_physical_devices('GPU')
+        visible_gpus = tf.config.get_visible_devices('GPU')
+
+        logger.info(f"🖥️ GPUs físicas detectadas: {len(gpus)}")
+        logger.info(f"🖥️ GPUs visíveis (deve ser 0): {len(visible_gpus)}")
+        logger.info("✅ TensorFlow configurado para CPU APENAS")
+
         return True
 
     except Exception as e:
@@ -163,29 +171,52 @@ def configure_tensorflow():
         return False
 
 def load_model_safe():
-    """Carrega o modelo com configurações de segurança"""
+    """Carrega o modelo com configurações de segurança máxima"""
     try:
-        # Importar TensorFlow apenas quando necessário
+        logger.info("🔄 Iniciando carregamento seguro do modelo...")
+
+        # Configurar TensorFlow ANTES de qualquer importação
+        configure_tensorflow()
+
+        # Importar TensorFlow apenas quando necessário e após configuração
+        logger.info("📦 Importando TensorFlow/Keras...")
         from keras.models import load_model
         from keras.applications.inception_v3 import preprocess_input
-
-        # Configurar TensorFlow
-        configure_tensorflow()
 
         # Verificar memória antes do carregamento
         memory_before = get_memory_usage()
         logger.info(f"💾 Memória antes do carregamento: {memory_before['rss_mb']}MB")
 
-        # Carregar modelo
-        logger.info("🔄 Carregando modelo...")
-        model = load_model(MODEL_PATH)
+        # Carregar modelo com timeout implícito
+        logger.info("🔄 Carregando modelo (pode demorar alguns minutos)...")
+        logger.info("⚠️ Usando APENAS CPU para máxima estabilidade")
+
+        try:
+            model = load_model(MODEL_PATH, compile=False)  # Não compilar para economizar memória
+            logger.info("✅ Modelo carregado sem compilação")
+
+            # Compilar manualmente de forma mais segura
+            logger.info("🔧 Compilando modelo...")
+            model.compile(
+                optimizer='adam',
+                loss='categorical_crossentropy',
+                metrics=['accuracy']
+            )
+            logger.info("✅ Modelo compilado com sucesso")
+
+        except Exception as load_error:
+            logger.error(f"❌ Erro no carregamento: {load_error}")
+            # Tentar carregamento alternativo
+            logger.info("🔄 Tentando carregamento alternativo...")
+            model = load_model(MODEL_PATH)
 
         # Verificar memória após carregamento
         memory_after = get_memory_usage()
         logger.info(f"💾 Memória após carregamento: {memory_after['rss_mb']}MB")
         logger.info(f"📈 Incremento de memória: {memory_after['rss_mb'] - memory_before['rss_mb']:.1f}MB")
 
-        # Fazer uma predição de teste
+        # Fazer uma predição de teste simples
+        logger.info("🧪 Testando modelo com predição simples...")
         test_input = np.random.random((1, 256, 256, 3)).astype(np.float32)
         test_prediction = model.predict(test_input, verbose=0)
 
@@ -196,8 +227,16 @@ def load_model_safe():
 
     except Exception as e:
         logger.error(f"❌ Erro ao carregar modelo: {e}")
+        logger.error(f"🔍 Tipo do erro: {type(e).__name__}")
+
         # Forçar limpeza de memória
+        logger.info("🧹 Limpando memória...")
         gc.collect()
+
+        # Log de memória após erro
+        memory_after_error = get_memory_usage()
+        logger.info(f"💾 Memória após erro: {memory_after_error['rss_mb']}MB")
+
         raise e
 
 def download_and_load_model():
