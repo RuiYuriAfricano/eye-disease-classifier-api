@@ -93,7 +93,19 @@ def download_and_load_model():
 @app.on_event("startup")
 async def startup_event():
     """Evento executado na inicialização da API"""
-    download_and_load_model()
+    import asyncio
+    import threading
+
+    logger.info("🚀 Iniciando API do Eye Disease Classifier...")
+    logger.info("📍 API estará disponível para healthcheck imediatamente")
+    logger.info("🔄 Modelo será carregado em background...")
+
+    # Carregar modelo em thread separada para não bloquear a API
+    def load_model_background():
+        download_and_load_model()
+
+    thread = threading.Thread(target=load_model_background, daemon=True)
+    thread.start()
 
 @app.get("/")
 async def root():
@@ -109,10 +121,27 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Endpoint para verificar saúde da API"""
-    return {
-        "status": "healthy",
-        "model_loaded": model is not None
-    }
+    global model
+
+    if model is None:
+        return {
+            "status": "starting",
+            "message": "API iniciando, modelo sendo carregado...",
+            "model_loaded": False
+        }
+    elif model == "demo_mode":
+        return {
+            "status": "healthy",
+            "message": "API funcionando em modo demo",
+            "model_loaded": False,
+            "demo_mode": True
+        }
+    else:
+        return {
+            "status": "healthy",
+            "message": "API funcionando com modelo carregado",
+            "model_loaded": True
+        }
 
 def preprocess_image(image: Image.Image) -> np.ndarray:
     """Preprocessa a imagem para o modelo"""
@@ -222,6 +251,34 @@ async def predict_disease(file: UploadFile = File(...)) -> Dict:
 async def get_classes() -> Dict[str, List[str]]:
     """Retorna as classes disponíveis"""
     return {"classes": CLASS_NAMES}
+
+@app.get("/status")
+async def get_status():
+    """Retorna status detalhado da API e modelo"""
+    global model
+
+    # Verificar se arquivo do modelo existe
+    model_exists = os.path.exists(MODEL_PATH)
+    model_size = 0
+    if model_exists:
+        model_size = os.path.getsize(MODEL_PATH)
+
+    return {
+        "api_status": "running",
+        "model_status": {
+            "loaded": model is not None and model != "demo_mode",
+            "demo_mode": model == "demo_mode",
+            "file_exists": model_exists,
+            "file_size_mb": round(model_size / 1_000_000, 2) if model_size > 0 else 0,
+            "expected_size_mb": 169
+        },
+        "endpoints": {
+            "health": "/health",
+            "predict": "/predict",
+            "docs": "/docs",
+            "classes": "/classes"
+        }
+    }
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

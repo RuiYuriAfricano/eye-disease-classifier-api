@@ -4,5 +4,5 @@ builder = "DOCKERFILE"
 [deploy]
 startCommand = "python run_api.py"
 healthcheckPath = "/health"
-healthcheckTimeout = 300
+healthcheckTimeout = 600
 restartPolicyType = "ON_FAILURE"
