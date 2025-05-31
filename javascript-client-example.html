@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Eye Disease Classifier - Cliente JavaScript</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .upload-area {
+            border: 2px dashed #ccc;
+            border-radius: 10px;
+            padding: 40px;
+            text-align: center;
+            margin: 20px 0;
+            cursor: pointer;
+            transition: border-color 0.3s;
+        }
+        .upload-area:hover {
+            border-color: #007bff;
+        }
+        .preview-image {
+            max-width: 300px;
+            max-height: 300px;
+            margin: 20px 0;
+            border-radius: 10px;
+        }
+        .result {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+        }
+        .button {
+            background: #007bff;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        .button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .error {
+            color: #dc3545;
+            background: #f8d7da;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+        .demo-warning {
+            color: #856404;
+            background: #fff3cd;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+        .progress {
+            margin: 20px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔬 Classificador de Doenças Oculares</h1>
+        <p>Faça upload de uma imagem de olho para classificar possíveis doenças.</p>
+        
+        <!-- Configuração da API -->
+        <div>
+            <label for="apiUrl">URL da API:</label>
+            <input type="text" id="apiUrl" value="http://localhost:8000" style="width: 300px; padding: 5px;">
+            <small>Altere para a URL da sua API hospedada</small>
+        </div>
+        
+        <!-- Área de upload -->
+        <div class="upload-area" onclick="document.getElementById('fileInput').click()">
+            <input type="file" id="fileInput" accept="image/*" style="display: none;">
+            <p>📁 Clique aqui para selecionar uma imagem</p>
+            <p><small>Formatos suportados: JPG, JPEG, PNG</small></p>
+        </div>
+        
+        <!-- Preview da imagem -->
+        <div id="imagePreview"></div>
+        
+        <!-- Botão de classificar -->
+        <button id="classifyBtn" class="button" disabled>🔍 Classificar Imagem</button>
+        
+        <!-- Área de progresso -->
+        <div id="progress" class="progress" style="display: none;">
+            <p>⏳ Analisando imagem...</p>
+        </div>
+        
+        <!-- Área de resultado -->
+        <div id="result"></div>
+    </div>
+
+    <script>
+        // Configuração
+        let selectedFile = null;
+        
+        // Elementos DOM
+        const fileInput = document.getElementById('fileInput');
+        const imagePreview = document.getElementById('imagePreview');
+        const classifyBtn = document.getElementById('classifyBtn');
+        const resultDiv = document.getElementById('result');
+        const progressDiv = document.getElementById('progress');
+        const apiUrlInput = document.getElementById('apiUrl');
+        
+        // Event listeners
+        fileInput.addEventListener('change', handleFileSelect);
+        classifyBtn.addEventListener('click', classifyImage);
+        
+        function handleFileSelect(event) {
+            const file = event.target.files[0];
+            if (file) {
+                selectedFile = file;
+                
+                // Mostrar preview
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    imagePreview.innerHTML = `
+                        <h3>Imagem Selecionada:</h3>
+                        <img src="${e.target.result}" class="preview-image" alt="Preview">
+                        <p><strong>Arquivo:</strong> ${file.name}</p>
+                        <p><strong>Tamanho:</strong> ${(file.size / 1024 / 1024).toFixed(2)} MB</p>
+                    `;
+                };
+                reader.readAsDataURL(file);
+                
+                // Habilitar botão
+                classifyBtn.disabled = false;
+                
+                // Limpar resultado anterior
+                resultDiv.innerHTML = '';
+            }
+        }
+        
+        async function classifyImage() {
+            if (!selectedFile) {
+                showError('Por favor, selecione uma imagem primeiro.');
+                return;
+            }
+            
+            const apiUrl = apiUrlInput.value.trim();
+            if (!apiUrl) {
+                showError('Por favor, configure a URL da API.');
+                return;
+            }
+            
+            // Mostrar progresso
+            progressDiv.style.display = 'block';
+            classifyBtn.disabled = true;
+            resultDiv.innerHTML = '';
+            
+            try {
+                // Preparar dados
+                const formData = new FormData();
+                formData.append('file', selectedFile);
+                
+                // Fazer requisição
+                const response = await fetch(`${apiUrl}/predict`, {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`Erro HTTP: ${response.status}`);
+                }
+                
+                const result = await response.json();
+                showResult(result);
+                
+            } catch (error) {
+                showError(`Erro ao classificar imagem: ${error.message}`);
+            } finally {
+                progressDiv.style.display = 'none';
+                classifyBtn.disabled = false;
+            }
+        }
+        
+        function showResult(result) {
+            let html = '<div class="result"><h3>📊 Resultado da Classificação</h3>';
+            
+            // Aviso de modo demo
+            if (result.status === 'demo_mode') {
+                html += `<div class="demo-warning">
+                    <strong>⚠️ Modo Demo:</strong> ${result.message}
+                </div>`;
+            }
+            
+            // Resultado principal
+            html += `
+                <div style="margin: 15px 0;">
+                    <strong>🎯 Classe Predita:</strong> 
+                    <span style="font-size: 1.2em; color: #007bff;">${result.predicted_class}</span>
+                </div>
+                
+                <div style="margin: 15px 0;">
+                    <strong>📈 Confiança:</strong> 
+                    <span style="font-size: 1.1em; color: #28a745;">${(result.confidence * 100).toFixed(2)}%</span>
+                </div>
+                
+                <div style="margin: 15px 0;">
+                    <strong>📋 Todas as Probabilidades:</strong>
+                    <ul style="margin-top: 10px;">
+            `;
+            
+            // Listar todas as probabilidades
+            Object.entries(result.all_predictions)
+                .sort(([,a], [,b]) => b - a) // Ordenar por probabilidade
+                .forEach(([className, prob]) => {
+                    const percentage = (prob * 100).toFixed(2);
+                    const isHighest = className === result.predicted_class;
+                    html += `
+                        <li style="${isHighest ? 'font-weight: bold; color: #007bff;' : ''}">
+                            ${className}: ${percentage}%
+                        </li>
+                    `;
+                });
+            
+            html += '</ul></div></div>';
+            
+            resultDiv.innerHTML = html;
+        }
+        
+        function showError(message) {
+            resultDiv.innerHTML = `
+                <div class="error">
+                    <strong>❌ Erro:</strong> ${message}
+                </div>
+            `;
+        }
+        
+        // Testar conexão com a API ao carregar
+        window.addEventListener('load', async () => {
+            const apiUrl = apiUrlInput.value.trim();
+            try {
+                const response = await fetch(`${apiUrl}/health`);
+                if (response.ok) {
+                    console.log('✅ API conectada com sucesso');
+                } else {
+                    console.warn('⚠️ API não está respondendo corretamente');
+                }
+            } catch (error) {
+                console.warn('⚠️ Não foi possível conectar à API:', error.message);
+            }
+        });
+    </script>
+</body>
+</html>
