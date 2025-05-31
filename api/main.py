@@ -2,14 +2,22 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 import numpy as np
-from keras.models import load_model
-from keras.applications.inception_v3 import preprocess_input
 import gdown
 import os
 import io
 import uvicorn
 from typing import Dict, List
 import logging
+import threading
+import time
+import hashlib
+import gc
+import psutil
+
+# Configurar TensorFlow antes de importar
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduzir logs do TensorFlow
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # Crescimento gradual da GPU
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Desabilitar otimizações que podem causar problemas
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -19,9 +27,15 @@ logger = logging.getLogger(__name__)
 MODEL_PATH = "best_model.keras"
 MODEL_URL = "https://drive.google.com/uc?id=1vSIfD3viT5JSxpG4asA8APCwK0JK9Dvu"
 CLASS_NAMES = ['cataract', 'diabetic_retinopathy', 'glaucoma', 'normal']
+EXPECTED_MODEL_SIZE = 169_000_000  # 169MB em bytes
+MODEL_HASH_FILE = "model_hash.txt"
 
-# Variável global para o modelo
+# Variáveis globais para o modelo
 model = None
+model_loading = False
+model_load_error = None
+model_load_attempts = 0
+MAX_LOAD_ATTEMPTS = 3
 
 app = FastAPI(
     title="Eye Disease Classifier API",
@@ -38,94 +52,217 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def get_memory_usage():
+    """Retorna uso atual de memória"""
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    return {
+        "rss_mb": round(memory_info.rss / 1024 / 1024, 2),
+        "vms_mb": round(memory_info.vms / 1024 / 1024, 2),
+        "percent": round(process.memory_percent(), 2)
+    }
+
+def calculate_file_hash(filepath):
+    """Calcula hash MD5 do arquivo para verificar integridade"""
+    hash_md5 = hashlib.md5()
+    try:
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    except Exception as e:
+        logger.error(f"Erro ao calcular hash: {e}")
+        return None
+
+def verify_model_integrity():
+    """Verifica se o modelo baixado está íntegro"""
+    if not os.path.exists(MODEL_PATH):
+        return False, "Arquivo não existe"
+
+    file_size = os.path.getsize(MODEL_PATH)
+    if file_size < EXPECTED_MODEL_SIZE * 0.9:  # Pelo menos 90% do tamanho esperado
+        return False, f"Arquivo muito pequeno: {file_size / 1_000_000:.1f}MB (esperado: {EXPECTED_MODEL_SIZE / 1_000_000:.1f}MB)"
+
+    # Verificar hash se disponível
+    if os.path.exists(MODEL_HASH_FILE):
+        try:
+            with open(MODEL_HASH_FILE, 'r') as f:
+                expected_hash = f.read().strip()
+            current_hash = calculate_file_hash(MODEL_PATH)
+            if current_hash and current_hash != expected_hash:
+                return False, "Hash do arquivo não confere"
+        except Exception as e:
+            logger.warning(f"Erro ao verificar hash: {e}")
+
+    return True, "Arquivo íntegro"
+
+def download_model_with_retry(max_retries=3):
+    """Baixa o modelo com retry automático"""
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"🔽 Tentativa {attempt + 1}/{max_retries} de download...")
+
+            # Limpar arquivos parciais
+            if os.path.exists(MODEL_PATH):
+                os.remove(MODEL_PATH)
+
+            # Download com timeout
+            gdown.download(
+                MODEL_URL,
+                MODEL_PATH,
+                quiet=False,
+                fuzzy=True
+            )
+
+            # Verificar integridade
+            is_valid, message = verify_model_integrity()
+            if is_valid:
+                logger.info(f"✅ Download bem-sucedido! {message}")
+                # Salvar hash para verificações futuras
+                file_hash = calculate_file_hash(MODEL_PATH)
+                if file_hash:
+                    with open(MODEL_HASH_FILE, 'w') as f:
+                        f.write(file_hash)
+                return True
+            else:
+                logger.warning(f"⚠️ Download inválido: {message}")
+                if attempt < max_retries - 1:
+                    time.sleep(5)  # Aguardar antes da próxima tentativa
+
+        except Exception as e:
+            logger.error(f"❌ Erro no download (tentativa {attempt + 1}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(5)
+
+    return False
+
+def configure_tensorflow():
+    """Configura TensorFlow para uso otimizado de memória"""
+    try:
+        import tensorflow as tf
+
+        # Configurar crescimento de memória da GPU
+        gpus = tf.config.experimental.list_physical_devices('GPU')
+        if gpus:
+            try:
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                logger.info(f"✅ Configurado crescimento de memória para {len(gpus)} GPU(s)")
+            except RuntimeError as e:
+                logger.warning(f"Erro ao configurar GPU: {e}")
+
+        # Configurar threads para CPU
+        tf.config.threading.set_intra_op_parallelism_threads(2)
+        tf.config.threading.set_inter_op_parallelism_threads(2)
+
+        logger.info("✅ TensorFlow configurado para uso otimizado de memória")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Erro ao configurar TensorFlow: {e}")
+        return False
+
+def load_model_safe():
+    """Carrega o modelo com configurações de segurança"""
+    try:
+        # Importar TensorFlow apenas quando necessário
+        from keras.models import load_model
+        from keras.applications.inception_v3 import preprocess_input
+
+        # Configurar TensorFlow
+        configure_tensorflow()
+
+        # Verificar memória antes do carregamento
+        memory_before = get_memory_usage()
+        logger.info(f"💾 Memória antes do carregamento: {memory_before['rss_mb']}MB")
+
+        # Carregar modelo
+        logger.info("🔄 Carregando modelo...")
+        model = load_model(MODEL_PATH)
+
+        # Verificar memória após carregamento
+        memory_after = get_memory_usage()
+        logger.info(f"💾 Memória após carregamento: {memory_after['rss_mb']}MB")
+        logger.info(f"📈 Incremento de memória: {memory_after['rss_mb'] - memory_before['rss_mb']:.1f}MB")
+
+        # Fazer uma predição de teste
+        test_input = np.random.random((1, 256, 256, 3)).astype(np.float32)
+        test_prediction = model.predict(test_input, verbose=0)
+
+        logger.info("✅ Modelo carregado e testado com sucesso!")
+        logger.info(f"📊 Modelo pronto para classificar {len(CLASS_NAMES)} classes")
+
+        return model
+
+    except Exception as e:
+        logger.error(f"❌ Erro ao carregar modelo: {e}")
+        # Forçar limpeza de memória
+        gc.collect()
+        raise e
+
 def download_and_load_model():
-    """Baixa e carrega o modelo se necessário"""
-    global model
+    """Baixa e carrega o modelo com mecanismo robusto"""
+    global model, model_loading, model_load_error, model_load_attempts
+
+    if model_loading:
+        logger.info("⏳ Carregamento já em andamento...")
+        return
+
+    model_loading = True
+    model_load_attempts += 1
 
     try:
-        logger.info("🔄 Iniciando processo de carregamento do modelo...")
+        logger.info(f"🔄 Iniciando carregamento do modelo (tentativa {model_load_attempts}/{MAX_LOAD_ATTEMPTS})...")
 
-        # Verificar se o modelo já existe e está completo
+        # Verificar se o modelo já existe e está íntegro
         if os.path.exists(MODEL_PATH):
-            file_size = os.path.getsize(MODEL_PATH)
-            if file_size > 100_000_000:  # Pelo menos 100MB
-                logger.info("✅ Modelo já existe e parece estar completo!")
+            is_valid, message = verify_model_integrity()
+            if is_valid:
+                logger.info(f"✅ Modelo existente verificado: {message}")
             else:
-                logger.info("⚠️ Arquivo do modelo existe mas parece incompleto. Removendo...")
-                try:
-                    os.remove(MODEL_PATH)
-                except Exception as e:
-                    logger.warning(f"Não foi possível remover arquivo incompleto: {e}")
+                logger.warning(f"⚠️ Modelo existente inválido: {message}")
+                os.remove(MODEL_PATH)
 
-        # Remover arquivos .part se existirem
-        try:
-            part_files = [f for f in os.listdir('.') if f.startswith('best_model.keras') and '.part' in f]
-            for part_file in part_files:
-                logger.info(f"🗑️ Removendo arquivo parcial: {part_file}")
-                os.remove(part_file)
-        except Exception as e:
-            logger.warning(f"Erro ao limpar arquivos parciais: {e}")
-
-        # Baixar modelo se não existir ou foi removido
+        # Baixar modelo se necessário
         if not os.path.exists(MODEL_PATH):
             logger.info("🔽 Baixando modelo do Google Drive...")
             logger.info("📦 Tamanho esperado: ~169MB")
             logger.info("⏳ Isso pode levar alguns minutos...")
 
-            try:
-                # Usar gdown com configurações otimizadas
-                gdown.download(
-                    MODEL_URL,
-                    MODEL_PATH,
-                    quiet=False,
-                    fuzzy=True  # Permite download mesmo com avisos do Google Drive
-                )
-
-                # Verificar se o download foi bem-sucedido
-                if os.path.exists(MODEL_PATH):
-                    file_size = os.path.getsize(MODEL_PATH)
-                    logger.info(f"✅ Modelo baixado! Tamanho: {file_size / 1_000_000:.1f}MB")
-                else:
-                    raise Exception("Falha no download do modelo")
-            except Exception as e:
-                logger.error(f"❌ Erro no download: {e}")
-                raise e
+            if not download_model_with_retry():
+                raise Exception("Falha no download após múltiplas tentativas")
 
         # Carregar modelo
-        logger.info("🔄 Carregando modelo...")
-        try:
-            # Tentar carregar o modelo com configurações otimizadas
-            import os
-            os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduzir logs do TensorFlow
+        model = load_model_safe()
+        model_load_error = None
 
-            model = load_model(MODEL_PATH)
-            logger.info("✅ Modelo carregado com sucesso!")
-            logger.info(f"📊 Modelo pronto para classificar {len(CLASS_NAMES)} classes")
-
-        except Exception as e:
-            logger.error(f"❌ Erro ao carregar modelo do arquivo: {e}")
-            # Se falhar ao carregar, tentar remover arquivo corrompido
-            try:
-                if os.path.exists(MODEL_PATH):
-                    os.remove(MODEL_PATH)
-                    logger.info("🗑️ Arquivo do modelo removido (possivelmente corrompido)")
-            except Exception as cleanup_error:
-                logger.warning(f"Erro ao limpar arquivo: {cleanup_error}")
-            raise e
+        logger.info("🎉 Modelo carregado com sucesso!")
 
     except Exception as e:
-        logger.error(f"❌ Erro geral no carregamento do modelo: {str(e)}")
-        logger.info("🔄 Continuando em modo demo (predições simuladas)")
-        model = "demo_mode"
+        error_msg = f"Erro no carregamento do modelo: {str(e)}"
+        logger.error(f"❌ {error_msg}")
+        model_load_error = error_msg
+
+        if model_load_attempts < MAX_LOAD_ATTEMPTS:
+            logger.info(f"🔄 Tentativa {model_load_attempts + 1}/{MAX_LOAD_ATTEMPTS} será feita automaticamente")
+            model = "demo_mode"
+        else:
+            logger.error("❌ Máximo de tentativas atingido. Continuando em modo demo.")
+            model = "demo_mode"
+
+    finally:
+        model_loading = False
 
 @app.on_event("startup")
 async def startup_event():
     """Evento executado na inicialização da API"""
-    import threading
-
     logger.info("🚀 Iniciando API do Eye Disease Classifier...")
     logger.info("📍 API estará disponível para healthcheck imediatamente")
     logger.info("🔄 Modelo será carregado em background...")
+
+    # Mostrar informações do sistema
+    memory_info = get_memory_usage()
+    logger.info(f"💾 Memória inicial: {memory_info['rss_mb']}MB ({memory_info['percent']}%)")
 
     # Carregar modelo em thread separada para não bloquear a API
     def load_model_background():
@@ -156,23 +293,45 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Endpoint para verificar saúde da API"""
-    global model
+    global model, model_loading, model_load_error, model_load_attempts
+
+    memory_info = get_memory_usage()
+
+    base_response = {
+        "memory_usage": memory_info,
+        "load_attempts": model_load_attempts,
+        "max_attempts": MAX_LOAD_ATTEMPTS
+    }
 
     if model is None:
-        return {
-            "status": "starting",
-            "message": "API iniciando, modelo sendo carregado...",
-            "model_loaded": False
-        }
+        if model_loading:
+            return {
+                **base_response,
+                "status": "loading",
+                "message": "Modelo sendo carregado...",
+                "model_loaded": False,
+                "loading": True
+            }
+        else:
+            return {
+                **base_response,
+                "status": "starting",
+                "message": "API iniciando, modelo será carregado...",
+                "model_loaded": False,
+                "error": model_load_error
+            }
     elif model == "demo_mode":
         return {
+            **base_response,
             "status": "healthy",
             "message": "API funcionando em modo demo",
             "model_loaded": False,
-            "demo_mode": True
+            "demo_mode": True,
+            "error": model_load_error
         }
     else:
         return {
+            **base_response,
             "status": "healthy",
             "message": "API funcionando com modelo carregado",
             "model_loaded": True
@@ -180,23 +339,28 @@ async def health_check():
 
 def preprocess_image(image: Image.Image) -> np.ndarray:
     """Preprocessa a imagem para o modelo"""
-    # Converter para RGB se necessário
-    if image.mode != 'RGB':
-        image = image.convert('RGB')
-    
-    # Redimensionar para 256x256
-    image = image.resize((256, 256))
-    
-    # Converter para array numpy
-    img_array = np.array(image)
-    
-    # Preprocessar usando inception_v3
-    img_array = preprocess_input(img_array)
-    
-    # Adicionar dimensão do batch
-    img_array = np.expand_dims(img_array, axis=0)
-    
-    return img_array
+    try:
+        # Converter para RGB se necessário
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+
+        # Redimensionar para 256x256
+        image = image.resize((256, 256))
+
+        # Converter para array numpy
+        img_array = np.array(image)
+
+        # Preprocessar usando inception_v3
+        from keras.applications.inception_v3 import preprocess_input
+        img_array = preprocess_input(img_array)
+
+        # Adicionar dimensão do batch
+        img_array = np.expand_dims(img_array, axis=0)
+
+        return img_array
+    except Exception as e:
+        logger.error(f"Erro no preprocessamento da imagem: {e}")
+        raise e
 
 @app.post("/predict")
 async def predict_disease(file: UploadFile = File(...)) -> Dict:
@@ -290,28 +454,99 @@ async def get_classes() -> Dict[str, List[str]]:
 @app.get("/status")
 async def get_status():
     """Retorna status detalhado da API e modelo"""
-    global model
+    global model, model_loading, model_load_error, model_load_attempts
 
     # Verificar se arquivo do modelo existe
     model_exists = os.path.exists(MODEL_PATH)
     model_size = 0
+    model_hash = None
+
     if model_exists:
         model_size = os.path.getsize(MODEL_PATH)
+        model_hash = calculate_file_hash(MODEL_PATH)
+
+    # Verificar integridade
+    is_valid, integrity_message = verify_model_integrity() if model_exists else (False, "Arquivo não existe")
+
+    memory_info = get_memory_usage()
 
     return {
         "api_status": "running",
         "model_status": {
             "loaded": model is not None and model != "demo_mode",
             "demo_mode": model == "demo_mode",
+            "loading": model_loading,
             "file_exists": model_exists,
             "file_size_mb": round(model_size / 1_000_000, 2) if model_size > 0 else 0,
-            "expected_size_mb": 169
+            "expected_size_mb": round(EXPECTED_MODEL_SIZE / 1_000_000, 2),
+            "integrity_valid": is_valid,
+            "integrity_message": integrity_message,
+            "file_hash": model_hash[:16] + "..." if model_hash else None,
+            "load_attempts": model_load_attempts,
+            "max_attempts": MAX_LOAD_ATTEMPTS,
+            "last_error": model_load_error
+        },
+        "system": {
+            "memory_usage": memory_info,
+            "tensorflow_configured": True
         },
         "endpoints": {
             "health": "/health",
             "predict": "/predict",
             "docs": "/docs",
-            "classes": "/classes"
+            "classes": "/classes",
+            "reload_model": "/reload-model",
+            "memory": "/memory"
+        }
+    }
+
+@app.post("/reload-model")
+async def reload_model():
+    """Força o recarregamento do modelo"""
+    global model, model_loading, model_load_error, model_load_attempts
+
+    if model_loading:
+        return {
+            "status": "error",
+            "message": "Carregamento já em andamento"
+        }
+
+    # Reset das variáveis
+    model = None
+    model_load_error = None
+    model_load_attempts = 0
+
+    # Iniciar carregamento em background
+    def reload_background():
+        download_and_load_model()
+
+    thread = threading.Thread(target=reload_background, daemon=True)
+    thread.start()
+
+    return {
+        "status": "success",
+        "message": "Recarregamento do modelo iniciado"
+    }
+
+@app.get("/memory")
+async def get_memory_info():
+    """Retorna informações detalhadas de memória"""
+    memory_info = get_memory_usage()
+
+    # Informações do sistema
+    system_memory = psutil.virtual_memory()
+
+    return {
+        "process": memory_info,
+        "system": {
+            "total_mb": round(system_memory.total / 1024 / 1024, 2),
+            "available_mb": round(system_memory.available / 1024 / 1024, 2),
+            "used_mb": round(system_memory.used / 1024 / 1024, 2),
+            "percent": round(system_memory.percent, 2)
+        },
+        "model_status": {
+            "loaded": model is not None and model != "demo_mode",
+            "demo_mode": model == "demo_mode"
         }
     }
 
