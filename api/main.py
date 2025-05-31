@@ -43,6 +43,8 @@ def download_and_load_model():
     global model
 
     try:
+        logger.info("🔄 Iniciando processo de carregamento do modelo...")
+
         # Verificar se o modelo já existe e está completo
         if os.path.exists(MODEL_PATH):
             file_size = os.path.getsize(MODEL_PATH)
@@ -50,13 +52,19 @@ def download_and_load_model():
                 logger.info("✅ Modelo já existe e parece estar completo!")
             else:
                 logger.info("⚠️ Arquivo do modelo existe mas parece incompleto. Removendo...")
-                os.remove(MODEL_PATH)
+                try:
+                    os.remove(MODEL_PATH)
+                except Exception as e:
+                    logger.warning(f"Não foi possível remover arquivo incompleto: {e}")
 
         # Remover arquivos .part se existirem
-        part_files = [f for f in os.listdir('.') if f.startswith('best_model.keras') and '.part' in f]
-        for part_file in part_files:
-            logger.info(f"🗑️ Removendo arquivo parcial: {part_file}")
-            os.remove(part_file)
+        try:
+            part_files = [f for f in os.listdir('.') if f.startswith('best_model.keras') and '.part' in f]
+            for part_file in part_files:
+                logger.info(f"🗑️ Removendo arquivo parcial: {part_file}")
+                os.remove(part_file)
+        except Exception as e:
+            logger.warning(f"Erro ao limpar arquivos parciais: {e}")
 
         # Baixar modelo se não existir ou foi removido
         if not os.path.exists(MODEL_PATH):
@@ -64,36 +72,55 @@ def download_and_load_model():
             logger.info("📦 Tamanho esperado: ~169MB")
             logger.info("⏳ Isso pode levar alguns minutos...")
 
-            # Usar gdown com configurações otimizadas
-            gdown.download(
-                MODEL_URL,
-                MODEL_PATH,
-                quiet=False,
-                fuzzy=True  # Permite download mesmo com avisos do Google Drive
-            )
+            try:
+                # Usar gdown com configurações otimizadas
+                gdown.download(
+                    MODEL_URL,
+                    MODEL_PATH,
+                    quiet=False,
+                    fuzzy=True  # Permite download mesmo com avisos do Google Drive
+                )
 
-            # Verificar se o download foi bem-sucedido
-            if os.path.exists(MODEL_PATH):
-                file_size = os.path.getsize(MODEL_PATH)
-                logger.info(f"✅ Modelo baixado! Tamanho: {file_size / 1_000_000:.1f}MB")
-            else:
-                raise Exception("Falha no download do modelo")
+                # Verificar se o download foi bem-sucedido
+                if os.path.exists(MODEL_PATH):
+                    file_size = os.path.getsize(MODEL_PATH)
+                    logger.info(f"✅ Modelo baixado! Tamanho: {file_size / 1_000_000:.1f}MB")
+                else:
+                    raise Exception("Falha no download do modelo")
+            except Exception as e:
+                logger.error(f"❌ Erro no download: {e}")
+                raise e
 
         # Carregar modelo
         logger.info("🔄 Carregando modelo...")
-        model = load_model(MODEL_PATH)
-        logger.info("✅ Modelo carregado com sucesso!")
-        logger.info(f"📊 Modelo pronto para classificar {len(CLASS_NAMES)} classes")
+        try:
+            # Tentar carregar o modelo com configurações otimizadas
+            import os
+            os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduzir logs do TensorFlow
+
+            model = load_model(MODEL_PATH)
+            logger.info("✅ Modelo carregado com sucesso!")
+            logger.info(f"📊 Modelo pronto para classificar {len(CLASS_NAMES)} classes")
+
+        except Exception as e:
+            logger.error(f"❌ Erro ao carregar modelo do arquivo: {e}")
+            # Se falhar ao carregar, tentar remover arquivo corrompido
+            try:
+                if os.path.exists(MODEL_PATH):
+                    os.remove(MODEL_PATH)
+                    logger.info("🗑️ Arquivo do modelo removido (possivelmente corrompido)")
+            except Exception as cleanup_error:
+                logger.warning(f"Erro ao limpar arquivo: {cleanup_error}")
+            raise e
 
     except Exception as e:
-        logger.error(f"❌ Erro ao carregar modelo: {str(e)}")
+        logger.error(f"❌ Erro geral no carregamento do modelo: {str(e)}")
         logger.info("🔄 Continuando em modo demo (predições simuladas)")
         model = "demo_mode"
 
 @app.on_event("startup")
 async def startup_event():
     """Evento executado na inicialização da API"""
-    import asyncio
     import threading
 
     logger.info("🚀 Iniciando API do Eye Disease Classifier...")
@@ -102,10 +129,18 @@ async def startup_event():
 
     # Carregar modelo em thread separada para não bloquear a API
     def load_model_background():
-        download_and_load_model()
+        try:
+            download_and_load_model()
+        except Exception as e:
+            logger.error(f"❌ Erro crítico no carregamento do modelo: {e}")
+            # Garantir que a API continue funcionando em modo demo
+            global model
+            model = "demo_mode"
 
     thread = threading.Thread(target=load_model_background, daemon=True)
     thread.start()
+
+    logger.info("✅ API iniciada com sucesso!")
 
 @app.get("/")
 async def root():
