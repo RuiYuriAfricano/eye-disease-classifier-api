@@ -28,12 +28,35 @@ os.environ['OMP_NUM_THREADS'] = '1'  # Limitar OpenMP threads
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Importar módulo de retreinamento (após configurar TensorFlow)
+try:
+    from retrain_endpoint import add_retrain_endpoint, RetrainRequest
+    RETRAIN_AVAILABLE = True
+    logger.info("✅ Módulo de retreinamento carregado")
+except ImportError as e:
+    RETRAIN_AVAILABLE = False
+    logger.warning(f"⚠️ Módulo de retreinamento não disponível: {e}")
+
 # Configurações do modelo
 MODEL_PATH = "best_model.keras"
 MODEL_URL = "https://drive.google.com/uc?id=1vSIfD3viT5JSxpG4asA8APCwK0JK9Dvu"
 CLASS_NAMES = ['cataract', 'diabetic_retinopathy', 'glaucoma', 'normal']
 EXPECTED_MODEL_SIZE = 169_000_000  # 169MB em bytes
 MODEL_HASH_FILE = "model_hash.txt"
+
+# Possíveis localizações de modelos locais
+POSSIBLE_MODEL_PATHS = [
+    "best_model.keras",
+    "best_model.h5",
+    "model.keras",
+    "model.h5",
+    "eye_disease_model.keras",
+    "eye_disease_model.h5",
+    "models/best_model.keras",
+    "models/best_model.h5",
+    "../models/best_model.keras",
+    "../models/best_model.h5"
+]
 
 # Variáveis globais para o modelo
 model = None
@@ -80,26 +103,72 @@ def calculate_file_hash(filepath):
         return None
 
 def verify_model_integrity():
-    """Verifica se o modelo baixado está íntegro"""
+    """Verifica se o modelo está íntegro - flexível para modelos locais"""
     if not os.path.exists(MODEL_PATH):
         return False, "Arquivo não existe"
 
     file_size = os.path.getsize(MODEL_PATH)
-    if file_size < EXPECTED_MODEL_SIZE * 0.9:  # Pelo menos 90% do tamanho esperado
-        return False, f"Arquivo muito pequeno: {file_size / 1_000_000:.1f}MB (esperado: {EXPECTED_MODEL_SIZE / 1_000_000:.1f}MB)"
 
-    # Verificar hash se disponível
+    # Verificação mais flexível para modelos locais
+    min_size = 50_000_000  # 50MB mínimo (mais flexível)
+    max_size = 300_000_000  # 300MB máximo (para detectar arquivos corrompidos)
+
+    if file_size < min_size:
+        return False, f"Arquivo muito pequeno: {file_size / 1_000_000:.1f}MB (mínimo: {min_size / 1_000_000:.1f}MB)"
+
+    if file_size > max_size:
+        return False, f"Arquivo muito grande: {file_size / 1_000_000:.1f}MB (máximo: {max_size / 1_000_000:.1f}MB)"
+
+    # Verificar se é um arquivo Keras válido (extensão e estrutura básica)
+    if not MODEL_PATH.endswith(('.keras', '.h5')):
+        return False, "Extensão de arquivo inválida (deve ser .keras ou .h5)"
+
+    # Verificar hash apenas se disponível (não obrigatório para modelos locais)
     if os.path.exists(MODEL_HASH_FILE):
         try:
             with open(MODEL_HASH_FILE, 'r') as f:
                 expected_hash = f.read().strip()
             current_hash = calculate_file_hash(MODEL_PATH)
             if current_hash and current_hash != expected_hash:
-                return False, "Hash do arquivo não confere"
+                logger.warning("Hash do arquivo não confere, mas continuando (modelo local)")
         except Exception as e:
             logger.warning(f"Erro ao verificar hash: {e}")
 
-    return True, "Arquivo íntegro"
+    return True, f"Arquivo válido: {file_size / 1_000_000:.1f}MB"
+
+def find_local_model():
+    """Procura por modelos locais em diferentes localizações"""
+    logger.info("🔍 Procurando por modelos locais...")
+
+    for model_path in POSSIBLE_MODEL_PATHS:
+        if os.path.exists(model_path):
+            file_size = os.path.getsize(model_path)
+            logger.info(f"📁 Modelo encontrado: {model_path} ({file_size / 1_000_000:.1f}MB)")
+
+            # Verificar se parece ser um modelo válido
+            if file_size > 50_000_000:  # Pelo menos 50MB
+                logger.info(f"✅ Modelo local detectado: {model_path}")
+                return model_path
+            else:
+                logger.warning(f"⚠️ Arquivo muito pequeno, ignorando: {model_path}")
+
+    logger.info("❌ Nenhum modelo local encontrado")
+    return None
+
+def setup_model_path():
+    """Configura o caminho do modelo, priorizando modelos locais"""
+    global MODEL_PATH
+
+    # Primeiro, tentar encontrar modelo local
+    local_model = find_local_model()
+    if local_model:
+        MODEL_PATH = local_model
+        logger.info(f"🎯 Usando modelo local: {MODEL_PATH}")
+        return True
+
+    # Se não encontrou, usar o caminho padrão
+    logger.info(f"📦 Usando caminho padrão: {MODEL_PATH}")
+    return False
 
 def download_model_with_retry(max_retries=3):
     """Baixa o modelo com retry automático"""
@@ -240,7 +309,7 @@ def load_model_safe():
         raise e
 
 def download_and_load_model():
-    """Baixa e carrega o modelo com mecanismo robusto"""
+    """Carrega modelo local ou baixa se necessário - com fallback robusto"""
     global model, model_loading, model_load_error, model_load_attempts
 
     if model_loading:
@@ -253,40 +322,79 @@ def download_and_load_model():
     try:
         logger.info(f"🔄 Iniciando carregamento do modelo (tentativa {model_load_attempts}/{MAX_LOAD_ATTEMPTS})...")
 
-        # Verificar se o modelo já existe e está íntegro
-        if os.path.exists(MODEL_PATH):
-            is_valid, message = verify_model_integrity()
-            if is_valid:
-                logger.info(f"✅ Modelo existente verificado: {message}")
-            else:
-                logger.warning(f"⚠️ Modelo existente inválido: {message}")
-                os.remove(MODEL_PATH)
+        # PRIORIDADE 0: Detectar modelos locais automaticamente
+        setup_model_path()
 
-        # Baixar modelo se necessário
+        # PRIORIDADE 1: Verificar se existe modelo local válido
+        if os.path.exists(MODEL_PATH):
+            logger.info("📁 Modelo local encontrado, verificando integridade...")
+            is_valid, message = verify_model_integrity()
+
+            if is_valid:
+                logger.info(f"✅ Modelo local válido: {message}")
+                # Tentar carregar o modelo local
+                try:
+                    model = load_model_safe()
+                    model_load_error = None
+                    logger.info("🎉 Modelo local carregado com sucesso!")
+                    return
+                except Exception as load_error:
+                    logger.warning(f"⚠️ Erro ao carregar modelo local: {load_error}")
+                    logger.info("🔄 Tentando redownload...")
+                    # Continuar para download se carregamento falhar
+            else:
+                logger.warning(f"⚠️ Modelo local inválido: {message}")
+                logger.info("🗑️ Removendo modelo corrompido...")
+                try:
+                    os.remove(MODEL_PATH)
+                except:
+                    pass
+
+        # PRIORIDADE 2: Tentar baixar modelo se não existe ou é inválido
         if not os.path.exists(MODEL_PATH):
-            logger.info("🔽 Baixando modelo do Google Drive...")
+            logger.info("🔽 Modelo local não encontrado, tentando download...")
             logger.info("📦 Tamanho esperado: ~169MB")
             logger.info("⏳ Isso pode levar alguns minutos...")
 
-            if not download_model_with_retry():
-                raise Exception("Falha no download após múltiplas tentativas")
+            try:
+                if download_model_with_retry():
+                    logger.info("✅ Download concluído, carregando modelo...")
+                    model = load_model_safe()
+                    model_load_error = None
+                    logger.info("🎉 Modelo baixado e carregado com sucesso!")
+                    return
+                else:
+                    raise Exception("Falha no download após múltiplas tentativas")
+            except Exception as download_error:
+                logger.error(f"❌ Erro no download: {download_error}")
+                # Continuar para fallback
 
-        # Carregar modelo
-        model = load_model_safe()
-        model_load_error = None
+        # PRIORIDADE 3: Tentar carregar modelo mesmo com problemas de integridade
+        if os.path.exists(MODEL_PATH):
+            logger.info("🔄 Tentando carregar modelo mesmo com possíveis problemas...")
+            try:
+                model = load_model_safe()
+                model_load_error = None
+                logger.info("🎉 Modelo carregado com sucesso (ignorando verificação de integridade)!")
+                return
+            except Exception as final_load_error:
+                logger.error(f"❌ Falha final no carregamento: {final_load_error}")
 
-        logger.info("🎉 Modelo carregado com sucesso!")
+        # Se chegou aqui, todas as tentativas falharam
+        raise Exception("Todas as tentativas de carregamento falharam")
 
     except Exception as e:
         error_msg = f"Erro no carregamento do modelo: {str(e)}"
         logger.error(f"❌ {error_msg}")
         model_load_error = error_msg
 
+        # FALLBACK: Modo demo
         if model_load_attempts < MAX_LOAD_ATTEMPTS:
             logger.info(f"🔄 Tentativa {model_load_attempts + 1}/{MAX_LOAD_ATTEMPTS} será feita automaticamente")
             model = "demo_mode"
         else:
             logger.error("❌ Máximo de tentativas atingido. Continuando em modo demo.")
+            logger.info("🎭 Modo demo permite testar a API sem modelo real")
             model = "demo_mode"
 
     finally:
@@ -588,6 +696,32 @@ async def get_memory_info():
             "demo_mode": model == "demo_mode"
         }
     }
+
+# === ENDPOINTS DE RETREINAMENTO ===
+
+if RETRAIN_AVAILABLE:
+    try:
+        add_retrain_endpoint(app, model)
+        logger.info("✅ Endpoints de retreinamento adicionados")
+    except Exception as e:
+        logger.error(f"❌ Erro ao adicionar endpoints de retreinamento: {e}")
+else:
+    @app.post("/retrain")
+    async def retrain_unavailable():
+        """Endpoint de retreinamento não disponível"""
+        raise HTTPException(
+            status_code=503,
+            detail="Retreinamento não disponível. Módulo não carregado."
+        )
+
+    @app.get("/retrain/status")
+    async def retrain_status_unavailable():
+        """Status do retreinamento quando não disponível"""
+        return {
+            "retrain_available": False,
+            "error": "Módulo de retreinamento não carregado",
+            "model_loaded": model is not None and model != "demo_mode"
+        }
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
